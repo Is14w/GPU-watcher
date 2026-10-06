@@ -28,7 +28,22 @@ use tokio::{
 use tokio_util::io::ReaderStream;
 use tracing::{error, info, warn};
 
-const NVIDIA_QUERY: &str = "LANG=C nvidia-smi --query-gpu=index,uuid,name,driver_version,pstate,temperature.gpu,utilization.gpu,utilization.memory,memory.used,memory.total,power.draw,power.limit,fan.speed,clocks.current.graphics,clocks.current.memory --format=csv,noheader,nounits; printf '\\n__NOVA_PROCESSES__\\n'; LANG=C nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader,nounits 2>/dev/null || true";
+/// 远端快照流的结束边界标记。
+const SNAPSHOT_END_MARKER: &str = "__NOVA_SNAPSHOT_END__";
+
+/// 采集流的空闲看门狗：超过该时长没有任何数据就重建连接。
+const STATS_STREAM_IDLE_LIMIT: Duration = Duration::from_secs(25);
+
+const STDERR_TAIL_LIMIT: usize = 600;
+
+/// 长连接采集命令：在远端持续输出带边界标记的快照流，
+/// 整个采集会话只发起这一次 exec 请求。
+fn stats_stream_command(interval: Duration) -> String {
+    format!(
+        "command -v nvidia-smi >/dev/null 2>&1 || {{ printf 'nvidia-smi not found on remote host\\n' >&2; exit 127; }}; export LANG=C LC_ALL=C; while :; do nvidia-smi --query-gpu=index,uuid,name,driver_version,pstate,temperature.gpu,utilization.gpu,utilization.memory,memory.used,memory.total,power.draw,power.limit,fan.speed,clocks.current.graphics,clocks.current.memory --format=csv,noheader,nounits; printf '\\n__NOVA_PROCESSES__\\n'; nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader,nounits 2>/dev/null || true; printf '__NOVA_SNAPSHOT_END__\\n'; sleep {:.3}; done",
+        interval.as_secs_f64()
+    )
+}
 
 #[derive(Clone)]
 struct CollectorConfig {
@@ -443,42 +458,6 @@ async fn close_ssh(connection: SshConnection) {
         .await;
 }
 
-async fn run_remote(connection: &mut SshConnection, command: &str) -> Result<String, String> {
-    let mut channel = connection
-        .handle
-        .channel_open_session()
-        .await
-        .map_err(|error| format!("无法创建 SSH 通道：{error}"))?;
-    channel
-        .exec(true, command.as_bytes())
-        .await
-        .map_err(|error| format!("远程命令启动失败：{error}"))?;
-
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    let mut status = None;
-    while let Some(message) = channel.wait().await {
-        match message {
-            ChannelMsg::Data { data } => stdout.extend_from_slice(&data),
-            ChannelMsg::ExtendedData { data, .. } => stderr.extend_from_slice(&data),
-            ChannelMsg::ExitStatus { exit_status } => status = Some(exit_status),
-            ChannelMsg::Eof | ChannelMsg::Close => break,
-            _ => {}
-        }
-    }
-    let _ = channel.close().await;
-    let stdout = String::from_utf8_lossy(&stdout).to_string();
-    if status.unwrap_or(0) != 0 {
-        let detail = if stderr.is_empty() {
-            stdout.trim().to_string()
-        } else {
-            String::from_utf8_lossy(&stderr).trim().to_string()
-        };
-        return Err(format!("远程 nvidia-smi 执行失败：{detail}"));
-    }
-    Ok(stdout)
-}
-
 fn parse_number(value: Option<&&str>) -> Option<f64> {
     value
         .map(|item| item.trim())
@@ -541,14 +520,135 @@ fn parse_snapshot(output: &str) -> Result<Snapshot, String> {
     })
 }
 
-async fn collect_snapshot(connection: &mut SshConnection) -> Result<Snapshot, String> {
-    let output = tokio::time::timeout(
-        Duration::from_secs(25),
-        run_remote(connection, NVIDIA_QUERY),
-    )
-    .await
-    .map_err(|_| "远程 nvidia-smi 采集超时".to_string())??;
-    parse_snapshot(&output)
+/// 把远程采集流的字节增量拼接为完整的快照文本块。
+#[derive(Default)]
+struct SnapshotAssembler {
+    pending: Vec<u8>,
+    block: String,
+}
+
+impl SnapshotAssembler {
+    /// 喂入一段通道数据，返回这段数据补齐的全部完整快照块。
+    fn push(&mut self, bytes: &[u8]) -> Vec<String> {
+        self.pending.extend_from_slice(bytes);
+        let mut blocks = Vec::new();
+        while let Some(position) = self.pending.iter().position(|byte| *byte == b'\n') {
+            let line = String::from_utf8_lossy(&self.pending[..position]).to_string();
+            self.pending.drain(..=position);
+            let line = line.trim_end_matches('\r');
+            if line == SNAPSHOT_END_MARKER {
+                let block = std::mem::take(&mut self.block);
+                if !block.trim().is_empty() {
+                    blocks.push(block);
+                }
+            } else {
+                self.block.push_str(line);
+                self.block.push('\n');
+            }
+        }
+        blocks
+    }
+}
+
+fn append_stderr_tail(tail: &mut String, data: &[u8]) {
+    tail.push_str(&String::from_utf8_lossy(data));
+    if tail.len() > STDERR_TAIL_LIMIT {
+        let mut cut = tail.len() - STDERR_TAIL_LIMIT;
+        while !tail.is_char_boundary(cut) {
+            cut += 1;
+        }
+        tail.drain(..cut);
+    }
+}
+
+fn stream_ended_message(stderr_tail: &str) -> String {
+    let detail = stderr_tail.trim();
+    if detail.is_empty() {
+        "远程采集流已结束".to_string()
+    } else {
+        let end = detail
+            .char_indices()
+            .nth(300)
+            .map_or(detail.len(), |(index, _)| index);
+        format!("远程采集流已结束：{}", &detail[..end])
+    }
+}
+
+/// 与桌面端一致的长连接采集：连接后只 exec 一次远程循环命令，
+/// 之后持续读取带边界标记的快照流并逐块解析，不再周期性发起 SSH 请求。
+async fn run_stats_stream(
+    state: &AppState,
+    connection: &mut SshConnection,
+    interval: Duration,
+    received_snapshot: &mut bool,
+) -> Result<(), String> {
+    let mut channel = connection
+        .handle
+        .channel_open_session()
+        .await
+        .map_err(|error| format!("无法创建 SSH 通道：{error}"))?;
+    channel
+        .exec(true, stats_stream_command(interval).as_bytes())
+        .await
+        .map_err(|error| format!("远程命令启动失败：{error}"))?;
+
+    let mut assembler = SnapshotAssembler::default();
+    let mut stderr_tail = String::new();
+    let mut idle = Duration::ZERO;
+    loop {
+        // wait() 底层是 tokio mpsc 的 recv()，被超时取消不会丢失通道消息。
+        match tokio::time::timeout(Duration::from_millis(100), channel.wait()).await {
+            Err(_) => {
+                idle += Duration::from_millis(100);
+                if idle >= STATS_STREAM_IDLE_LIMIT {
+                    let _ = channel.close().await;
+                    return Err(format!(
+                        "采集流超过 {} 秒没有新数据",
+                        STATS_STREAM_IDLE_LIMIT.as_secs()
+                    ));
+                }
+            }
+            Ok(None) => {
+                let _ = channel.close().await;
+                return Err(stream_ended_message(&stderr_tail));
+            }
+            Ok(Some(ChannelMsg::Data { data })) => {
+                idle = Duration::ZERO;
+                for block in assembler.push(&data) {
+                    let snapshot = parse_snapshot(&block).map_err(|error| {
+                        let detail = stderr_tail.trim();
+                        if detail.is_empty() {
+                            error
+                        } else {
+                            format!("{error}：{detail}")
+                        }
+                    })?;
+                    *received_snapshot = true;
+                    match append_snapshot(&state.session_file, &snapshot).await {
+                        Ok(()) => {
+                            let mut runtime = state.runtime.write().await;
+                            record_snapshot(&mut runtime, snapshot);
+                        }
+                        Err(message) => {
+                            error!(error = %message, "原始采样持久化失败，将继续尝试");
+                            set_failure(state, message, "degraded").await;
+                        }
+                    }
+                }
+            }
+            Ok(Some(ChannelMsg::ExtendedData { data, .. })) => {
+                idle = Duration::ZERO;
+                append_stderr_tail(&mut stderr_tail, &data);
+            }
+            Ok(Some(ChannelMsg::Eof | ChannelMsg::Close)) => {
+                let _ = channel.close().await;
+                return Err(stream_ended_message(&stderr_tail));
+            }
+            Ok(Some(_)) => {
+                idle = Duration::ZERO;
+            }
+        }
+    }
 }
 
 async fn append_snapshot(path: &Path, snapshot: &Snapshot) -> Result<(), String> {
@@ -653,33 +753,23 @@ async fn collector_loop(state: AppState, config: CollectorConfig, target: SshTar
                     runtime.connected_at = Some(now_millis());
                     runtime.last_error = None;
                 }
-                info!(target = %state.target_label, "SSH 已连接");
+                info!(target = %state.target_label, "SSH 已连接，启动流式采集");
                 let mut received_snapshot = false;
-                loop {
-                    match collect_snapshot(&mut connection).await {
-                        Ok(snapshot) => match append_snapshot(&state.session_file, &snapshot).await
-                        {
-                            Ok(()) => {
-                                received_snapshot = true;
-                                reconnect_delay = Duration::from_secs(1);
-                                let mut runtime = state.runtime.write().await;
-                                record_snapshot(&mut runtime, snapshot);
-                            }
-                            Err(message) => {
-                                error!(error = %message, "原始采样持久化失败，将继续尝试");
-                                set_failure(&state, message, "degraded").await;
-                            }
-                        },
-                        Err(message) => {
-                            warn!(error = %message, "SSH 采集失败，将重建连接");
-                            set_failure(&state, message, "reconnecting").await;
-                            break;
-                        }
-                    }
-                    tokio::time::sleep(config.interval).await;
+                if let Err(message) = run_stats_stream(
+                    &state,
+                    &mut connection,
+                    config.interval,
+                    &mut received_snapshot,
+                )
+                .await
+                {
+                    warn!(error = %message, "SSH 采集流中断，将重建连接");
+                    set_failure(&state, message, "reconnecting").await;
                 }
                 close_ssh(connection).await;
-                if !received_snapshot {
+                if received_snapshot {
+                    reconnect_delay = Duration::from_secs(1);
+                } else {
                     reconnect_delay = (reconnect_delay * 2).min(config.reconnect_max);
                 }
             }
@@ -912,6 +1002,22 @@ mod tests {
         let snapshot = parse_snapshot(output).expect("snapshot should parse");
         assert_eq!(snapshot.gpus.len(), 1);
         assert_eq!(snapshot.gpus[0].gpu_utilization, Some(72.0));
+        assert_eq!(snapshot.processes.len(), 1);
+        assert_eq!(snapshot.processes[0].pid, 123);
+    }
+
+    #[test]
+    fn snapshot_assembler_joins_chunks_into_blocks() {
+        let mut assembler = SnapshotAssembler::default();
+        assert!(assembler
+            .push(b"0, GPU-1, NVIDIA RTX, 555.1, P2, 61, 72, 41, 2048, 24576, 180, 300, 45, 1900, 9000\r\n__NOVA_PRO")
+            .is_empty());
+        let blocks = assembler.push(
+            b"CESSES__\nGPU-1, 123, python, 1024\n__NOVA_SNAPSHOT_END__\n0, GPU-1, NVIDIA RTX",
+        );
+        assert_eq!(blocks.len(), 1);
+        let snapshot = parse_snapshot(&blocks[0]).expect("snapshot should parse");
+        assert_eq!(snapshot.gpus.len(), 1);
         assert_eq!(snapshot.processes.len(), 1);
         assert_eq!(snapshot.processes[0].pid, 123);
     }

@@ -524,9 +524,146 @@ fn parse_snapshot(output: &str) -> Result<Snapshot, String> {
     })
 }
 
-async fn collect_snapshot(session: &mut SshConnection) -> Result<Snapshot, String> {
-    let command = "LANG=C nvidia-smi --query-gpu=index,uuid,name,driver_version,pstate,temperature.gpu,utilization.gpu,utilization.memory,memory.used,memory.total,power.draw,power.limit,fan.speed,clocks.current.graphics,clocks.current.memory --format=csv,noheader,nounits; printf '\\n__GPU_WATCHER_PROCESSES__\\n'; LANG=C nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader,nounits 2>/dev/null || true";
-    parse_snapshot(&run_remote_async(session, command).await?)
+/// 远端快照流的结束边界标记。
+const SNAPSHOT_END_MARKER: &str = "__GPU_WATCHER_SNAPSHOT_END__";
+
+/// 长连接采集命令：在远端持续输出带边界标记的快照流。
+/// 与 nvitop 终端一致，整个监控会话只发起这一次 exec 请求。
+const STATS_STREAM_COMMAND: &str = "command -v nvidia-smi >/dev/null 2>&1 || { printf 'nvidia-smi not found on remote host\\n' >&2; exit 127; }; export LANG=C LC_ALL=C; while :; do nvidia-smi --query-gpu=index,uuid,name,driver_version,pstate,temperature.gpu,utilization.gpu,utilization.memory,memory.used,memory.total,power.draw,power.limit,fan.speed,clocks.current.graphics,clocks.current.memory --format=csv,noheader,nounits; printf '\\n__GPU_WATCHER_PROCESSES__\\n'; nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader,nounits 2>/dev/null || true; printf '__GPU_WATCHER_SNAPSHOT_END__\\n'; sleep 1; done";
+
+/// 采集流的空闲看门狗：超过该时长没有任何数据就重建连接。
+const STATS_STREAM_IDLE_LIMIT: Duration = Duration::from_secs(25);
+
+const STDERR_TAIL_LIMIT: usize = 600;
+
+/// 把远程采集流的字节增量拼接为完整的快照文本块。
+#[derive(Default)]
+struct SnapshotAssembler {
+    pending: Vec<u8>,
+    block: String,
+}
+
+impl SnapshotAssembler {
+    /// 喂入一段通道数据，返回这段数据补齐的全部完整快照块。
+    fn push(&mut self, bytes: &[u8]) -> Vec<String> {
+        self.pending.extend_from_slice(bytes);
+        let mut blocks = Vec::new();
+        while let Some(position) = self.pending.iter().position(|byte| *byte == b'\n') {
+            let line = String::from_utf8_lossy(&self.pending[..position]).to_string();
+            self.pending.drain(..=position);
+            let line = line.trim_end_matches('\r');
+            if line == SNAPSHOT_END_MARKER {
+                let block = std::mem::take(&mut self.block);
+                if !block.trim().is_empty() {
+                    blocks.push(block);
+                }
+            } else {
+                self.block.push_str(line);
+                self.block.push('\n');
+            }
+        }
+        blocks
+    }
+}
+
+fn append_stderr_tail(tail: &mut String, data: &[u8]) {
+    tail.push_str(&String::from_utf8_lossy(data));
+    if tail.len() > STDERR_TAIL_LIMIT {
+        let mut cut = tail.len() - STDERR_TAIL_LIMIT;
+        while !tail.is_char_boundary(cut) {
+            cut += 1;
+        }
+        tail.drain(..cut);
+    }
+}
+
+fn stream_ended_message(stderr_tail: &str) -> String {
+    let detail = stderr_tail.trim();
+    if detail.is_empty() {
+        "远程采集流已结束".to_string()
+    } else {
+        let end = detail
+            .char_indices()
+            .nth(300)
+            .map_or(detail.len(), |(index, _)| index);
+        format!("远程采集流已结束：{}", &detail[..end])
+    }
+}
+
+/// 与 nvitop 终端同款的长连接采集：连接后只 exec 一次远程循环命令，
+/// 之后持续读取带边界标记的快照流并逐块解析，不再周期性发起 SSH 请求。
+async fn run_stats_stream(
+    app: &AppHandle,
+    target_id: &str,
+    run_id: &str,
+    session: &mut SshConnection,
+    stop: &AtomicBool,
+    received_snapshot: &mut bool,
+) -> Result<(), String> {
+    let mut channel = session
+        .handle
+        .channel_open_session()
+        .await
+        .map_err(|error| format!("无法创建 SSH 通道：{error}"))?;
+    channel
+        .exec(true, STATS_STREAM_COMMAND.as_bytes())
+        .await
+        .map_err(|error| format!("远程命令启动失败：{error}"))?;
+
+    let mut assembler = SnapshotAssembler::default();
+    let mut stderr_tail = String::new();
+    let mut idle = Duration::ZERO;
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            let _ = channel.close().await;
+            return Ok(());
+        }
+        // wait() 底层是 tokio mpsc 的 recv()，被超时取消不会丢失通道消息。
+        match tokio::time::timeout(Duration::from_millis(100), channel.wait()).await {
+            Err(_) => {
+                idle += Duration::from_millis(100);
+                if idle >= STATS_STREAM_IDLE_LIMIT {
+                    let _ = channel.close().await;
+                    return Err(format!(
+                        "采集流超过 {} 秒没有新数据",
+                        STATS_STREAM_IDLE_LIMIT.as_secs()
+                    ));
+                }
+            }
+            Ok(None) => {
+                let _ = channel.close().await;
+                return Err(stream_ended_message(&stderr_tail));
+            }
+            Ok(Some(ChannelMsg::Data { data })) => {
+                idle = Duration::ZERO;
+                for block in assembler.push(&data) {
+                    let snapshot = parse_snapshot(&block).map_err(|error| {
+                        let detail = stderr_tail.trim();
+                        if detail.is_empty() {
+                            error
+                        } else {
+                            format!("{error}：{detail}")
+                        }
+                    })?;
+                    *received_snapshot = true;
+                    if !stop.load(Ordering::Relaxed) {
+                        emit_monitor(app, target_id, run_id, "snapshot", Some(snapshot), None);
+                    }
+                }
+            }
+            Ok(Some(ChannelMsg::ExtendedData { data, .. })) => {
+                idle = Duration::ZERO;
+                append_stderr_tail(&mut stderr_tail, &data);
+            }
+            Ok(Some(ChannelMsg::Eof | ChannelMsg::Close)) => {
+                let _ = channel.close().await;
+                return Err(stream_ended_message(&stderr_tail));
+            }
+            Ok(Some(_)) => {
+                idle = Duration::ZERO;
+            }
+        }
+    }
 }
 
 fn emit_monitor(
@@ -626,46 +763,28 @@ fn start_monitor(
                     }
                     emit_monitor(&app, &target_id, &run_id, "connected", None, None);
                     let mut received_snapshot = false;
-                    while !stop.load(Ordering::Relaxed) {
-                        match tauri::async_runtime::block_on(collect_snapshot(&mut session)) {
-                            Ok(snapshot) => {
-                                received_snapshot = true;
-                                reconnect_delay = Duration::from_secs(1);
-                                if !stop.load(Ordering::Relaxed) {
-                                    emit_monitor(
-                                        &app,
-                                        &target_id,
-                                        &run_id,
-                                        "snapshot",
-                                        Some(snapshot),
-                                        None,
-                                    );
-                                }
-                            }
-                            Err(error) => {
-                                if !stop.load(Ordering::Relaxed) {
-                                    emit_monitor(
-                                        &app,
-                                        &target_id,
-                                        &run_id,
-                                        "error",
-                                        None,
-                                        Some(error),
-                                    );
-                                }
-                                break;
-                            }
-                        }
-                        for _ in 0..10 {
-                            if stop.load(Ordering::Relaxed) {
-                                break;
-                            }
-                            thread::sleep(Duration::from_millis(100));
-                        }
-                    }
+                    let result = tauri::async_runtime::block_on(run_stats_stream(
+                        &app,
+                        &target_id,
+                        &run_id,
+                        &mut session,
+                        &stop,
+                        &mut received_snapshot,
+                    ));
                     tauri::async_runtime::block_on(close_ssh_async(session));
-                    if !received_snapshot {
-                        reconnect_delay = (reconnect_delay * 2).min(Duration::from_secs(30));
+                    match result {
+                        Ok(()) => break,
+                        Err(error) => {
+                            if !stop.load(Ordering::Relaxed) {
+                                emit_monitor(&app, &target_id, &run_id, "error", None, Some(error));
+                            }
+                            if received_snapshot {
+                                reconnect_delay = Duration::from_secs(1);
+                            } else {
+                                reconnect_delay =
+                                    (reconnect_delay * 2).min(Duration::from_secs(30));
+                            }
+                        }
                     }
                 }
                 Err(error) => {
@@ -1334,7 +1453,9 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_env_id, encode_env_id, escape_env, unescape_env};
+    use super::{
+        decode_env_id, encode_env_id, escape_env, unescape_env, parse_snapshot, SnapshotAssembler,
+    };
 
     #[test]
     fn credential_id_round_trip() {
@@ -1347,5 +1468,25 @@ mod tests {
         for value in ["plain", "quote\"and\\slash", "line1\nline2", "trailing\\"] {
             assert_eq!(unescape_env(&escape_env(value)), value);
         }
+    }
+
+    #[test]
+    fn snapshot_assembler_joins_chunks_into_blocks() {
+        let mut assembler = SnapshotAssembler::default();
+        assert!(assembler
+            .push(b"0, GPU-1, NVIDIA")
+            .is_empty());
+        assert!(assembler
+            .push(b" RTX, 555, P2, 61, 72, 41, 2048, 24576, 180, 300, 45, 1900, 9000\r\n__GPU_WATCHER_PRO")
+            .is_empty());
+        let blocks = assembler.push(
+            b"CESSES__\nGPU-1, 123, python, 1024\n__GPU_WATCHER_SNAPSHOT_END__\n0, GPU-1, NVIDIA RTX",
+        );
+        assert_eq!(blocks.len(), 1);
+        let snapshot = parse_snapshot(&blocks[0]).expect("snapshot should parse");
+        assert_eq!(snapshot.gpus.len(), 1);
+        assert_eq!(snapshot.gpus[0].gpu_utilization, Some(72.0));
+        assert_eq!(snapshot.processes.len(), 1);
+        assert_eq!(snapshot.processes[0].pid, 123);
     }
 }
